@@ -3,6 +3,8 @@ use std::collections::{hash_map::Entry, HashMap};
 use anyhow::{anyhow, ensure, Context};
 use rust_decimal::Decimal;
 
+use crate::client::AuthorizedWithdrawal;
+
 #[derive(Copy, Clone, Debug, Hash, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub(crate) struct TransactionId(pub(crate) u32);
 
@@ -32,7 +34,9 @@ impl TransactionDb {
         &mut self,
         transaction_id: TransactionId,
         amount: Decimal,
-    ) -> anyhow::Result<()> {
+    ) -> anyhow::Result<PersistedTx<Deposit>> {
+        ensure!(amount > Decimal::ZERO, "deposit amount must be > 0");
+
         match self.transactions.entry(transaction_id) {
             Entry::Occupied(_) => Err(anyhow!("transaction already exists")),
             Entry::Vacant(entry) => {
@@ -40,30 +44,40 @@ impl TransactionDb {
                     amount,
                     status: TransactionStatus::Deposited,
                 });
-                Ok(())
+                Ok(PersistedTx {
+                    transaction_id,
+                    amount,
+                    state: Deposit,
+                })
             }
         }
     }
 
     pub(crate) fn withdraw(
         &mut self,
-        transaction_id: TransactionId,
-        amount: Decimal,
-    ) -> anyhow::Result<()> {
-        match self.transactions.entry(transaction_id) {
+        withdrawal: AuthorizedWithdrawal,
+    ) -> anyhow::Result<PersistedTx<Withdrawal>> {
+        match self.transactions.entry(withdrawal.transaction_id()) {
             Entry::Occupied(_) => Err(anyhow!("transaction already exists")),
             Entry::Vacant(entry) => {
                 entry.insert_entry(TransactionState {
-                    amount,
+                    amount: *withdrawal.amount(),
                     status: TransactionStatus::Withdrawn,
                 });
-                Ok(())
+                Ok(PersistedTx {
+                    transaction_id: withdrawal.transaction_id(),
+                    amount: *withdrawal.amount(),
+                    state: Withdrawal,
+                })
             }
         }
     }
 
     /// Returns disputed amount.
-    pub(crate) fn dispute(&mut self, transaction_id: TransactionId) -> anyhow::Result<Decimal> {
+    pub(crate) fn dispute(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> anyhow::Result<PersistedTx<Dispute>> {
         let state = self
             .transactions
             .get_mut(&transaction_id)
@@ -77,11 +91,18 @@ impl TransactionDb {
             state.status
         );
         state.status = TransactionStatus::Disputed;
-        Ok(state.amount)
+        Ok(PersistedTx {
+            transaction_id,
+            amount: state.amount,
+            state: Dispute,
+        })
     }
 
     /// Returns resolved amount.
-    pub(crate) fn resolve(&mut self, transaction_id: TransactionId) -> anyhow::Result<Decimal> {
+    pub(crate) fn resolve(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> anyhow::Result<PersistedTx<Resolve>> {
         let state = self
             .transactions
             .get_mut(&transaction_id)
@@ -93,11 +114,18 @@ impl TransactionDb {
             state.status
         );
         state.status = TransactionStatus::Resolved;
-        Ok(state.amount)
+        Ok(PersistedTx {
+            transaction_id,
+            amount: state.amount,
+            state: Resolve,
+        })
     }
 
     /// Returns amount charged back.
-    pub(crate) fn chargeback(&mut self, transaction_id: TransactionId) -> anyhow::Result<Decimal> {
+    pub(crate) fn chargeback(
+        &mut self,
+        transaction_id: TransactionId,
+    ) -> anyhow::Result<PersistedTx<Chargeback>> {
         let state = self
             .transactions
             .get_mut(&transaction_id)
@@ -109,6 +137,30 @@ impl TransactionDb {
             state.status
         );
         state.status = TransactionStatus::Chargedback;
-        Ok(state.amount)
+        Ok(PersistedTx {
+            transaction_id,
+            amount: state.amount,
+            state: Chargeback,
+        })
     }
 }
+
+/// note: each state type could have additional fields specific to that state.
+#[allow(dead_code)]
+pub(crate) struct PersistedTx<S> {
+    transaction_id: TransactionId,
+    amount: Decimal,
+    state: S,
+}
+
+impl<S> PersistedTx<S> {
+    pub(crate) fn amount(&self) -> Decimal {
+        self.amount
+    }
+}
+
+pub(crate) struct Deposit;
+pub(crate) struct Withdrawal;
+pub(crate) struct Dispute;
+pub(crate) struct Resolve;
+pub(crate) struct Chargeback;

@@ -1,4 +1,6 @@
-use anyhow::{bail, Context};
+use std::{fs::File, io};
+
+use anyhow::{bail, ensure, Context};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -42,32 +44,38 @@ fn process_operation(
     match operation.op_type {
         OperationType::Deposit => {
             let amount = operation.amount.context("no amount for deposit")?;
-            transactions.deposit(operation.tx, amount)?;
-            client.deposit(amount);
+            let deposit = transactions.deposit(operation.tx, amount)?;
+            client.deposit(deposit)?;
         }
         OperationType::Withdrawal => {
             let amount = operation.amount.context("no amount for withdrawal")?;
-            client.check_withdrawal(amount)?;
-            transactions.withdraw(operation.tx, amount)?;
-            client.withdraw(amount);
+            let authorized_withdrawal = client.authorize_withdrawal(operation.tx, amount)?;
+            let withdrawal = transactions.withdraw(authorized_withdrawal)?;
+            client.withdraw(withdrawal)?;
         }
         OperationType::Dispute => {
-            // We can validate dispute doesn't have `amount` specified.
-            // ensure!(operation.amount.is_none(), "amount isn't expected for dispute");
-            let amount = transactions.dispute(operation.tx)?;
-            client.dispute_deposit(amount);
+            ensure!(
+                operation.amount.is_none(),
+                "amount isn't expected for dispute"
+            );
+            let disputed = transactions.dispute(operation.tx)?;
+            client.dispute_deposit(disputed)?;
         }
         OperationType::Resolve => {
-            // We can validate resolve doesn't have `amount` specified.
-            // ensure!(operation.amount.is_none(), "amount isn't expected for resolve");
-            let amount = transactions.resolve(operation.tx)?;
-            client.resolve_dispute(amount);
+            ensure!(
+                operation.amount.is_none(),
+                "amount isn't expected for resolve"
+            );
+            let resolved = transactions.resolve(operation.tx)?;
+            client.resolve_dispute(resolved)?;
         }
         OperationType::Chargeback => {
-            // We can validate chargeback doesn't have `amount` specified.
-            // ensure!(operation.amount.is_none(), "amount isn't expected for chargeback");
-            let amount = transactions.chargeback(operation.tx)?;
-            client.chargeback(amount);
+            ensure!(
+                operation.amount.is_none(),
+                "amount isn't expected for chargeback"
+            );
+            let chargedback = transactions.chargeback(operation.tx)?;
+            client.chargeback(chargedback)?;
         }
     }
     Ok(())
@@ -82,48 +90,58 @@ struct ClientRow {
     locked: bool,
 }
 
+fn process_csv<R: io::Read, W: io::Write>(reader: R, writer: W) -> anyhow::Result<()> {
+    let mut clients = ClientDb::default();
+    let mut transactions = TransactionDb::default();
+
+    // read & update client accounts
+    {
+        let mut reader = csv::ReaderBuilder::new()
+            .trim(csv::Trim::All)
+            .has_headers(true)
+            .from_reader(reader);
+        for (idx, result) in reader.deserialize().enumerate() {
+            let operation: Operation = result.unwrap();
+            if let Err(error) = process_operation(&mut clients, &mut transactions, &operation) {
+                eprintln!("row #{idx}: {error}");
+            }
+        }
+    }
+
+    let mut writer = csv::WriterBuilder::new()
+        .has_headers(true)
+        .from_writer(writer);
+    for (client, state) in clients.all() {
+        const DECIMAL_PLACES: u32 = 4;
+
+        writer.serialize(ClientRow {
+            client,
+            available: state.available().round_dp(DECIMAL_PLACES),
+            held: state.held().round_dp(DECIMAL_PLACES),
+            total: state.total().round_dp(DECIMAL_PLACES),
+            locked: state.is_locked(),
+        })?;
+    }
+    writer.flush()?;
+    Ok(())
+}
+
 fn main() -> anyhow::Result<()> {
     let Some(input_path) = std::env::args().nth(1) else {
         bail!("first arg should be input filename");
     };
 
-    let mut clients = ClientDb::default();
-    let mut transactions = TransactionDb::default();
-
-    // buffered reading, does not load entire file
-    let mut reader = csv::ReaderBuilder::new()
-        .trim(csv::Trim::All)
-        .has_headers(true)
-        .from_path(input_path)
-        .unwrap();
-    for (idx, result) in reader.deserialize().enumerate() {
-        let operation: Operation = result.unwrap();
-        if let Err(error) = process_operation(&mut clients, &mut transactions, &operation) {
-            eprintln!("row #{idx}: {error}");
-        }
-    }
-    drop(reader);
-
-    // buffered writing
-    let mut writer = csv::WriterBuilder::new().from_writer(std::io::stdout());
-    writer.write_record(&["client", "available", "held", "total", "locked"])?;
-    for (client, state) in clients.all() {
-        writer.serialize(ClientRow {
-            client,
-            available: state.available(),
-            held: state.held(),
-            total: state.total(),
-            locked: state.is_locked(),
-        })?;
-    }
-    writer.flush()?;
-    drop(writer);
-
-    Ok(())
+    process_csv(
+        File::open(&input_path).with_context(|| format!("cannot open file '{input_path}'"))?,
+        io::stdout(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
+    use indoc::indoc;
+    use similar_asserts::assert_eq;
+
     use super::*;
 
     #[test]
@@ -266,5 +284,100 @@ mod tests {
         assert_eq!(client.is_locked(), false);
     }
 
-    // todo: test error scenarios
+    #[test]
+    fn test_example() {
+        const INPUT: &str = indoc! {"
+            type, client, tx, amount
+            deposit, 1, 1, 1.0
+            deposit, 2, 2, 2.0
+            deposit, 1, 3, 2.0
+            withdrawal, 1, 4, 1.5
+            withdrawal, 2, 5, 3.0
+        "};
+
+        const OUTPUT: &str = indoc! {"
+            client,available,held,total,locked
+            1,1.5,0,1.5,false
+            2,2,0,2,false
+        "};
+
+        let mut output = Vec::new();
+        process_csv(INPUT.as_bytes(), &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, OUTPUT);
+    }
+
+    #[test]
+    fn test_precision() {
+        const INPUT: &str = indoc! {"
+            type, client, tx, amount
+            deposit, 1, 1, 1000.2303
+            deposit, 1, 2, 2001.1533
+        "};
+
+        const OUTPUT: &str = indoc! {"
+            client,available,held,total,locked
+            1,3001.3836,0,3001.3836,false
+        "};
+
+        let mut output = Vec::new();
+        process_csv(INPUT.as_bytes(), &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, OUTPUT);
+    }
+
+    #[test]
+    fn test_output_rounding() {
+        const INPUT: &str = indoc! {"
+            type, client, tx, amount
+            deposit, 1, 1, 9.1333333
+        "};
+
+        const OUTPUT: &str = indoc! {"
+            client,available,held,total,locked
+            1,9.1333,0,9.1333,false
+        "};
+
+        let mut output = Vec::new();
+        process_csv(INPUT.as_bytes(), &mut output).unwrap();
+
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output, OUTPUT);
+    }
+
+    #[test]
+    fn test_negative_deposit() {
+        let mut clients = ClientDb::default();
+        let mut transactions = TransactionDb::default();
+        process_operation(
+            &mut clients,
+            &mut transactions,
+            &Operation {
+                op_type: OperationType::Deposit,
+                client: ClientId(123),
+                tx: TransactionId(999),
+                amount: Some((-1_i32).into()),
+            },
+        )
+        .unwrap_err();
+    }
+
+    #[test]
+    fn test_invalid_dispute() {
+        let mut clients = ClientDb::default();
+        let mut transactions = TransactionDb::default();
+        process_operation(
+            &mut clients,
+            &mut transactions,
+            &Operation {
+                op_type: OperationType::Dispute,
+                client: ClientId(123),
+                tx: TransactionId(999),
+                amount: None,
+            },
+        )
+        .unwrap_err();
+    }
 }
